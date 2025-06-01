@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <vector>
 #include <string> // Para manejar cadenas de texto
+#include <esp_wifi.h>
 
 // =======================================================================
 // ESTRUCTURAS Y DEFINICIONES GLOBALES
@@ -383,7 +384,10 @@ void join_network(const uint8_t *known_node_mac_addr) {
   esp_now_peer_info_t peerInfo;
   memset(&peerInfo, 0, sizeof(peerInfo));
   memcpy(peerInfo.peer_addr, known_node_mac_addr, 6);
-  peerInfo.channel = 0;
+  uint8_t primary_channel;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&primary_channel, &second);
+  peerInfo.channel = primary_channel;
   peerInfo.encrypt = false;
 
   if (esp_now_is_peer_exist(known_node_mac_addr) == false) {
@@ -398,6 +402,8 @@ void join_network(const uint8_t *known_node_mac_addr) {
   esp_err_t send_status = esp_now_send(known_node_mac_addr, (uint8_t *)&join_msg, sizeof(join_request_message_t));
   if (send_status == ESP_OK) {
     Serial.println("Solicitud JOIN enviada correctamente");
+    // Agrega el nodo destino a la lista de conocidos
+    add_node_to_known_list(known_node_mac_addr);
   } else {
     Serial.print("Error al enviar la solicitud JOIN: ");
     Serial.println(esp_err_to_name(send_status));
