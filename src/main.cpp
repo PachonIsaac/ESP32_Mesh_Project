@@ -34,7 +34,7 @@ typedef struct {
   uint8_t sender_mac[6];
   uint32_t message_id; // Identificador único del mensaje
   uint8_t ttl;         // Time To Live
-  uint8_t payload[250]; // Contenido del mensaje
+  uint8_t payload[200]; // Contenido del mensaje
 } broadcast_message_t;
 
 // Estructura para el mensaje SEND (Unicast con enrutamiento)
@@ -45,7 +45,7 @@ typedef struct {
   uint8_t hop_count; // Contador de saltos
   uint8_t max_hops;  // Límite máximo de saltos
   uint32_t message_id; // Para evitar duplicados en el reenvío
-  uint8_t payload[250]; // Contenido del mensaje
+  uint8_t payload[200]; // Contenido del mensaje
 } send_message_t;
 
 
@@ -116,8 +116,35 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
         printMacAddress(join_req->sender_mac);
         add_node_to_known_list(join_req->sender_mac);
 
-        // Opcional: Enviar una respuesta JOIN_RESPONSE al nodo que se unió
-        // Aquí podrías enviar tu propia MAC y la lista de nodos conocidos, por ejemplo
+        join_request_message_t join_resp; // Reutilizamos la estructura
+        join_resp.type = JOIN_RESPONSE_TYPE;
+        WiFi.macAddress(join_resp.sender_mac); // Mi propia MAC como remitente de la respuesta
+
+        esp_now_peer_info_t peerInfo;
+        memset(&peerInfo, 0, sizeof(peerInfo));
+        memcpy(peerInfo.peer_addr, join_req->sender_mac, 6); // Destino es el que envió el JOIN_REQUEST
+        uint8_t primary_channel;
+        wifi_second_chan_t second;
+        esp_wifi_get_channel(&primary_channel, &second);
+        peerInfo.channel = primary_channel;
+        peerInfo.encrypt = false;
+
+        // Asegurarse de que el peer exista (ya se agregó en add_node_to_known_list)
+        // Pero lo volvemos a asegurar si no se agregó correctamente o si la llamada directa es preferible
+        if (!esp_now_is_peer_exist(join_req->sender_mac)) {
+            esp_now_add_peer(&peerInfo); // Añadir el peer si por alguna razón no se hizo
+        }
+
+        esp_err_t send_resp_status = esp_now_send(join_req->sender_mac, (uint8_t *)&join_resp, sizeof(join_request_message_t));
+        if (send_resp_status == ESP_OK) {
+            Serial.print("JOIN_RESPONSE enviado a: ");
+            printMacAddress(join_req->sender_mac);
+        } else {
+            Serial.print("Error al enviar JOIN_RESPONSE a: ");
+            printMacAddress(join_req->sender_mac);
+            Serial.println(esp_err_to_name(send_resp_status));
+        }
+
       } else {
         Serial.println("Mensaje JOIN_REQUEST incompleto.");
       }
@@ -248,16 +275,16 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
         break;
     }
     case LEAVE_TYPE: {
-        if (data_len >= sizeof(message_t)) { // Solo necesitamos el tipo y sender_mac
-            message_t *leave_msg = (message_t *)data;
-            Serial.print("Solicitud LEAVE recibida de: ");
-            printMacAddress(leave_msg->sender_mac);
-            remove_node_from_known_list(leave_msg->sender_mac);
-            // Aquí podrías implementar la difusión de la información de LEAVE a otros nodos
-        } else {
-            Serial.println("Mensaje LEAVE incompleto.");
-        }
-        break;
+     if (data_len >= offsetof(message_t, payload)) { // Solo necesitamos type + sender_mac
+        message_t *leave_msg = (message_t *)data;
+         Serial.print("Solicitud LEAVE recibida de: ");
+         printMacAddress(leave_msg->sender_mac);
+         remove_node_from_known_list(leave_msg->sender_mac);
+         // Puedes propagar el LEAVE a otros nodos si querés
+     } else {
+         Serial.println("Mensaje LEAVE incompleto.");
+     }
+     break;
     }
     default:
       Serial.print("Tipo de mensaje desconocido: ");
@@ -294,7 +321,10 @@ void send_broadcast_message(const std::string& msg_payload) {
       esp_now_peer_info_t peerInfo;
       memset(&peerInfo, 0, sizeof(peerInfo));
       memcpy(peerInfo.peer_addr, node.mac_addr, 6);
-      peerInfo.channel = 0; // Usar el canal actual
+      uint8_t primary_channel;
+      wifi_second_chan_t second;
+      esp_wifi_get_channel(&primary_channel, &second);
+      peerInfo.channel = primary_channel; // <-- Canal real
       peerInfo.encrypt = false;
       if (esp_now_add_peer(&peerInfo) != ESP_OK) {
         Serial.print("Error al añadir peer ");
@@ -316,34 +346,51 @@ void send_broadcast_message(const std::string& msg_payload) {
 
 // Función para enviar un mensaje unicast (send)
 void send_unicast_message(const uint8_t *dest_mac, const std::string& msg_payload) {
+  uint8_t my_mac[6];
+  WiFi.macAddress(my_mac);
+  if (memcmp(dest_mac, my_mac, 6) == 0) {
+    Serial.println("No puedes enviarte un mensaje a ti mismo.");
+    return;
+  }
+
   send_message_t s_msg;
   s_msg.type = SEND_TYPE;
   WiFi.macAddress(s_msg.sender_mac);
   memcpy(s_msg.destination_mac, dest_mac, 6);
   s_msg.hop_count = 0;
-  s_msg.max_hops = 5; // Máximo de saltos para evitar bucles infinitos
-  s_msg.message_id = esp_random(); // ID único para el mensaje unicast
+  s_msg.max_hops = 5;
+  s_msg.message_id = esp_random();
 
   strncpy((char*)s_msg.payload, msg_payload.c_str(), sizeof(s_msg.payload) - 1);
-  s_msg.payload[sizeof(s_msg.payload) - 1] = '\0'; // Asegurar terminación nula
+  s_msg.payload[sizeof(s_msg.payload) - 1] = '\0';
 
-  // Intentar enviar directamente al destinatario si es un nodo conocido
-  // Esto es una simplificación; un enrutamiento real implica buscar el mejor "siguiente salto"
   if (isMacInKnownNodes(dest_mac)) {
       esp_now_peer_info_t peerInfo;
       memset(&peerInfo, 0, sizeof(peerInfo));
       memcpy(peerInfo.peer_addr, dest_mac, 6);
-      peerInfo.channel = 0;
+      uint8_t primary_channel;
+      wifi_second_chan_t second;
+      esp_wifi_get_channel(&primary_channel, &second);
+      peerInfo.channel = primary_channel;
       peerInfo.encrypt = false;
 
-      // Asegurar que el destino esté agregado como peer
-      if (!esp_now_is_peer_exist(dest_mac)) {
-        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-          Serial.print("Error al agregar peer para SEND ");
+      // Verifica que el mensaje no sea demasiado largo
+      if (msg_payload.length() >= sizeof(s_msg.payload)) {
+        Serial.println("Mensaje demasiado largo. Reduce el texto.");
+        return;
+      }
+
+      // Elimina el peer si ya existe
+      if (esp_now_is_peer_exist(dest_mac)) {
+        esp_now_del_peer(dest_mac);
+      }
+      // Intenta agregar el peer
+      esp_err_t add_status = esp_now_add_peer(&peerInfo);
+      if (add_status != ESP_OK) {
+          Serial.print("Error al agregar peer para SEND: ");
+          Serial.println(esp_err_to_name(add_status));
           printMacAddress(dest_mac);
-          Serial.println();
           return;
-        }
       }
 
       esp_err_t result = esp_now_send(dest_mac, (uint8_t *)&s_msg, sizeof(send_message_t));
@@ -359,10 +406,6 @@ void send_unicast_message(const uint8_t *dest_mac, const std::string& msg_payloa
       Serial.print("El nodo ");
       printMacAddress(dest_mac);
       Serial.println(" no es un vecino conocido. Iniciando reenvío.");
-      // Aquí se activaría la lógica de enrutamiento más compleja:
-      // Podrías enviar a todos los vecinos y que ellos reenvíen hasta que el mensaje llegue al destino
-      // (similar a un broadcast, pero con una MAC de destino y control de saltos).
-      // Por ahora, para la "profundidad", si no es un vecino directo, lo reenviamos a todos los conocidos.
       for (const auto& node : known_nodes) {
           esp_err_t result = esp_now_send(node.mac_addr, (uint8_t *)&s_msg, sizeof(send_message_t));
           if (result != ESP_OK) {
@@ -418,10 +461,11 @@ void leave_network() {
 
     // Enviar el mensaje LEAVE a todos los nodos conocidos
     for (const auto& node : known_nodes) {
-        esp_err_t result = esp_now_send(node.mac_addr, (uint8_t *)&leave_msg, sizeof(message_t));
+        esp_err_t result = esp_now_send(node.mac_addr, (uint8_t *)&leave_msg, offsetof(message_t, payload));
         if (result != ESP_OK) {
             Serial.print("Error al enviar LEAVE a ");
             printMacAddress(node.mac_addr);
+            Serial.print(": ");
             Serial.println(esp_err_to_name(result));
         }
     }
@@ -496,6 +540,14 @@ void handle_serial_input() {
       printMacAddress(my_mac);
       printKnownNodes();
     }
+    else if (command == "help") {
+      Serial.println("Comandos disponibles:");
+      Serial.println("  join <MAC>");
+      Serial.println("  send <MAC> <mensaje>");
+      Serial.println("  broadcast <mensaje>");
+      Serial.println("  leave");
+      Serial.println("  status");
+    }
     else {
       Serial.println("Comando desconocido. Comandos: join <MAC>, broadcast <mensaje>, send <MAC> <mensaje>, leave, status");
     }
@@ -505,6 +557,25 @@ void handle_serial_input() {
 // =======================================================================
 // FUNCIONES AUXILIARES (implementación)
 // =======================================================================
+
+// Funcion para añadir un peer si no existe
+bool add_peer_if_needed(const uint8_t *mac) {
+  if (!esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac, 6);
+    uint8_t primary_channel;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&primary_channel, &second);
+    peerInfo.channel = primary_channel;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.print("Error al añadir peer: ");
+      printMacAddress(mac);
+      return false;
+    }
+  }
+  return true;
+}
 
 void printMacAddress(const uint8_t *mac) {
   for (int i = 0; i < 6; i++) {
@@ -534,18 +605,23 @@ void add_node_to_known_list(const uint8_t *mac) {
     known_nodes.push_back(new_node);
     Serial.println("Nodo agregado a la lista de conocidos.");
     printKnownNodes();
-    // Cuando agregamos un nuevo nodo, también lo agregamos como peer de ESP-NOW
-    esp_now_peer_info_t peerInfo;
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    memcpy(peerInfo.peer_addr, mac, 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.print("Error al añadir peer ESP-NOW para ");
-      printMacAddress(mac);
-    } else {
-      Serial.print("Peer ESP-NOW añadido para ");
-      printMacAddress(mac);
+    // Solo agregar el nodo como peer de ESP-NOW si no existe
+    if (!esp_now_is_peer_exist(mac)) {
+      esp_now_peer_info_t peerInfo;
+      memset(&peerInfo, 0, sizeof(peerInfo));
+      memcpy(peerInfo.peer_addr, mac, 6);
+      uint8_t primary_channel;
+      wifi_second_chan_t second;
+      esp_wifi_get_channel(&primary_channel, &second);
+      peerInfo.channel = primary_channel;
+      peerInfo.encrypt = false;
+      if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.print("Error al añadir peer ESP-NOW para ");
+        printMacAddress(mac);
+      } else {
+        Serial.print("Peer ESP-NOW añadido para ");
+        printMacAddress(mac);
+      }
     }
   } else {
     Serial.println("Nodo ya estaba en la lista de conocidos.");
@@ -597,6 +673,7 @@ void setup() {
 
   // Establecer el modo Wi-Fi en estación
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   Serial.print("Modo Wi-Fi: ");
   if (WiFi.getMode() == WIFI_STA) {
     Serial.println("Estacion (WIFI_STA)");
