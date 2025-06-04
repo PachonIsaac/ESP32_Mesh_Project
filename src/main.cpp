@@ -1,9 +1,10 @@
-#include <Arduino.h> // Necesario para PlatformIO con framework Arduino
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <vector>
-#include <string> // Para manejar cadenas de texto
+#include <string> 
 #include <esp_wifi.h>
+#include <set>
 
 // =======================================================================
 // ESTRUCTURAS Y DEFINICIONES GLOBALES
@@ -48,7 +49,7 @@ typedef struct {
   uint32_t message_id;
   uint8_t path[MAX_HOPS][6];  // historial de nodos visitados
   uint8_t path_len;
-  uint8_t payload[180];       // reducido para dejar espacio al path
+  uint8_t payload[100];       // reducido para dejar espacio al path
 } send_message_t;
 
 
@@ -70,7 +71,6 @@ uint32_t broadcast_id_counter = 0; // Para generar IDs únicos para broadcast
 // Podríamos usar un vector de pares o una estructura para esto
 std::vector<std::pair<std::string, uint32_t>> processed_broadcast_messages;
 const int MAX_PROCESSED_BROADCAST_MESSAGES = 20; // Limitar el tamaño para no agotar la memoria
-
 std::set<uint32_t> seen_message_ids; // Para evitar duplicados
 
 // =======================================================================
@@ -215,6 +215,8 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
       break;
     }
     case SEND_TYPE: {
+      Serial.println(sizeof(send_message_t));
+
       if (data_len < sizeof(send_message_t)) {
         Serial.println("Mensaje SEND corrupto o incompleto.");
         break;
@@ -280,6 +282,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
       Serial.println("Mensaje reenviado a vecinos.");
       break;
     }
+
     case LEAVE_TYPE: {
      if (data_len >= offsetof(message_t, payload)) { // Solo necesitamos type + sender_mac
         message_t *leave_msg = (message_t *)data;
