@@ -18,8 +18,7 @@ typedef struct {
 typedef struct {
   uint8_t type;
   uint8_t sender_mac[6];
-  // Campos adicionales según el tipo de mensaje
-  uint8_t payload[250]; // Tamaño máximo del payload (ajustar si es necesario)
+  uint8_t payload[250]; // Tamaño máximo del payload 250 bytes
 } message_t;
 
 // Estructura para el mensaje JOIN_REQUEST
@@ -37,15 +36,19 @@ typedef struct {
   uint8_t payload[200]; // Contenido del mensaje
 } broadcast_message_t;
 
-// Estructura para el mensaje SEND (Unicast con enrutamiento)
+// Estructura para el mensaje SEND
+#define MAX_HOPS 10
+
 typedef struct {
   uint8_t type;
   uint8_t sender_mac[6];
   uint8_t destination_mac[6];
-  uint8_t hop_count; // Contador de saltos
-  uint8_t max_hops;  // Límite máximo de saltos
-  uint32_t message_id; // Para evitar duplicados en el reenvío
-  uint8_t payload[200]; // Contenido del mensaje
+  uint8_t hop_count;
+  uint8_t max_hops;
+  uint32_t message_id;
+  uint8_t path[MAX_HOPS][6];  // historial de nodos visitados
+  uint8_t path_len;
+  uint8_t payload[180];       // reducido para dejar espacio al path
 } send_message_t;
 
 
@@ -67,6 +70,8 @@ uint32_t broadcast_id_counter = 0; // Para generar IDs únicos para broadcast
 // Podríamos usar un vector de pares o una estructura para esto
 std::vector<std::pair<std::string, uint32_t>> processed_broadcast_messages;
 const int MAX_PROCESSED_BROADCAST_MESSAGES = 20; // Limitar el tamaño para no agotar la memoria
+
+std::set<uint32_t> seen_message_ids; // Para evitar duplicados
 
 // =======================================================================
 // FUNCIONES AUXILIARES (prototipos)
@@ -100,7 +105,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
   Serial.print(", longitud: ");
   Serial.println(data_len);
 
-  // Asegúrate de que el mensaje tenga al menos el tamaño mínimo para el tipo
+  // El mensaje tenga al menos el tamaño mínimo para el tipo
   if (data_len < sizeof(uint8_t)) {
     Serial.println("Mensaje recibido muy corto para determinar el tipo.");
     return;
@@ -130,7 +135,6 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
         peerInfo.encrypt = false;
 
         // Asegurarse de que el peer exista (ya se agregó en add_node_to_known_list)
-        // Pero lo volvemos a asegurar si no se agregó correctamente o si la llamada directa es preferible
         if (!esp_now_is_peer_exist(join_req->sender_mac)) {
             esp_now_add_peer(&peerInfo); // Añadir el peer si por alguna razón no se hizo
         }
@@ -160,12 +164,11 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
         Serial.print(", TTL: ");
         Serial.println(b_msg->ttl);
         Serial.print("Payload: ");
-        // Imprimir payload de forma segura (asegurando que sea una cadena si lo esperas)
+        // Imprimir payload
         for (int i = 0; i < data_len - offsetof(broadcast_message_t, payload); i++) {
             Serial.print((char)b_msg->payload[i]);
         }
         Serial.println();
-
 
         // Verificar si el mensaje ya fue procesado
         std::string sender_mac_str = "";
@@ -212,67 +215,70 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
       break;
     }
     case SEND_TYPE: {
-        if (data_len >= sizeof(send_message_t)) {
-            send_message_t *s_msg = (send_message_t *)data;
-            uint8_t my_mac[6];
-            WiFi.macAddress(my_mac);
-
-            Serial.print("Mensaje SEND recibido de ");
-            printMacAddress(s_msg->sender_mac);
-            Serial.print(" para ");
-            printMacAddress(s_msg->destination_mac);
-            Serial.print(", saltos: ");
-            Serial.println(s_msg->hop_count);
-            Serial.print("Payload: ");
-            for (int i = 0; i < data_len - offsetof(send_message_t, payload); i++) {
-                Serial.print((char)s_msg->payload[i]);
-            }
-            Serial.println();
-
-            // Si soy el destinatario
-            if (memcmp(s_msg->destination_mac, my_mac, 6) == 0) {
-                Serial.println("Soy el destinatario de este mensaje SEND.");
-                // Aquí procesar el mensaje final
-            } else {
-                // No soy el destinatario, debo reenviar
-                if (s_msg->hop_count < s_msg->max_hops) {
-                    s_msg->hop_count++; // Incrementar contador de saltos
-
-                    // Lógica de reenvío:
-                    // Por ahora, simplemente reenvía al primer nodo conocido que no sea el remitente original
-                    // Esto NO es un enrutamiento inteligente, es una inundación dirigida
-                    bool forwarded = false;
-                    for (const auto& node : known_nodes) {
-                        if (memcmp(node.mac_addr, mac_addr, 6) != 0) { // No enviar de vuelta al remitente
-                            // Asegurarse de que el destino es alcanzable desde este nodo o desde sus vecinos
-                            // (Esto requeriría una tabla de enrutamiento más compleja)
-
-                            // Por simplicidad en esta etapa, solo reenvía a un vecino si no es el remitente
-                            // Una implementación robusta necesitaría buscar el mejor siguiente salto hacia destination_mac
-                            esp_err_t result = esp_now_send(node.mac_addr, (uint8_t *)s_msg, sizeof(send_message_t));
-                            if (result == ESP_OK) {
-                                Serial.print("Reenviando SEND a ");
-                                printMacAddress(node.mac_addr);
-                                forwarded = true;
-                                break; // Solo reenviar a un vecino por ahora, para evitar inundación excesiva
-                            } else {
-                                Serial.print("Error al reenviar SEND a ");
-                                printMacAddress(node.mac_addr);
-                                Serial.println(esp_err_to_name(result));
-                            }
-                        }
-                    }
-                    if (!forwarded) {
-                        Serial.println("No se pudo reenviar el mensaje SEND (no hay vecino adecuado).");
-                    }
-                } else {
-                    Serial.println("Mensaje SEND descartado: máximo de saltos alcanzado.");
-                }
-            }
-        } else {
-            Serial.println("Mensaje SEND incompleto.");
-        }
+      if (data_len < sizeof(send_message_t)) {
+        Serial.println("Mensaje SEND corrupto o incompleto.");
         break;
+      }
+
+      send_message_t *msg = (send_message_t *)data;
+      uint8_t my_mac[6];
+      WiFi.macAddress(my_mac);
+
+      // Verifica duplicado
+      if (seen_message_ids.count(msg->message_id) > 0) {
+        Serial.println("Mensaje duplicado, descartado.");
+        break;
+      }
+      seen_message_ids.insert(msg->message_id);
+
+      // Verifica si ya pasamos por aquí
+      for (int i = 0; i < msg->path_len; i++) {
+        if (memcmp(msg->path[i], my_mac, 6) == 0) {
+          Serial.println("Ya he pasado por este nodo, deteniendo reenvío.");
+          return;
+        }
+      }
+
+      // Mostrar información
+      Serial.print("Mensaje SEND recibido de ");
+      printMacAddress(msg->sender_mac);
+      Serial.print(" para ");
+      printMacAddress(msg->destination_mac);
+      Serial.print(", saltos: ");
+      Serial.println(msg->hop_count);
+
+      Serial.print("Payload: ");
+      Serial.println((char*)msg->payload);
+
+      // Soy el destinatario
+      if (memcmp(my_mac, msg->destination_mac, 6) == 0) {
+        Serial.println("Soy el destinatario de este mensaje SEND.");
+        return;
+      }
+
+      // Verifica límite de saltos
+      if (msg->hop_count >= msg->max_hops) {
+        Serial.println("Límite de saltos alcanzado, no se reenvía.");
+        return;
+      }
+
+      // Prepara el mensaje para reenvío
+      msg->hop_count++;
+      memcpy(msg->path[msg->path_len], my_mac, 6);
+      msg->path_len++;
+
+      if (msg->path_len >= MAX_HOPS) {
+        Serial.println("Límite de nodos en el path alcanzado, no se reenvía.");
+        return;
+      }
+      
+      for (const auto& node : known_nodes) {
+        // No reenvíes al nodo del que vino
+        if (memcmp(node.mac_addr, msg->path[msg->path_len - 2], 6) == 0) continue;
+        esp_now_send(node.mac_addr, (uint8_t *)msg, sizeof(*msg));
+      }
+      Serial.println("Mensaje reenviado a vecinos.");
+      break;
     }
     case LEAVE_TYPE: {
      if (data_len >= offsetof(message_t, payload)) { // Solo necesitamos type + sender_mac
@@ -280,7 +286,15 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
          Serial.print("Solicitud LEAVE recibida de: ");
          printMacAddress(leave_msg->sender_mac);
          remove_node_from_known_list(leave_msg->sender_mac);
-         // Puedes propagar el LEAVE a otros nodos si querés
+        
+         // Propagar el LEAVE a otros nodos conocidos (excepto al que lo envió)
+        for (const auto& node : known_nodes) {
+            if (memcmp(node.mac_addr, mac_addr, 6) != 0) { // No reenviar al remitente
+                esp_now_send(node.mac_addr, data, offsetof(message_t, payload));
+                Serial.print("Propagando LEAVE a ");
+                printMacAddress(node.mac_addr);
+            }
+        }
      } else {
          Serial.println("Mensaje LEAVE incompleto.");
      }
@@ -353,70 +367,61 @@ void send_unicast_message(const uint8_t *dest_mac, const std::string& msg_payloa
     return;
   }
 
-  send_message_t s_msg;
+  send_message_t s_msg = {};
   s_msg.type = SEND_TYPE;
-  WiFi.macAddress(s_msg.sender_mac);
+  memcpy(s_msg.sender_mac, my_mac, 6);
   memcpy(s_msg.destination_mac, dest_mac, 6);
   s_msg.hop_count = 0;
-  s_msg.max_hops = 5;
+  s_msg.max_hops = MAX_HOPS;
   s_msg.message_id = esp_random();
+
+  // Inicializa el path con el nodo emisor
+  memcpy(s_msg.path[0], my_mac, 6);
+  s_msg.path_len = 1;
 
   strncpy((char*)s_msg.payload, msg_payload.c_str(), sizeof(s_msg.payload) - 1);
   s_msg.payload[sizeof(s_msg.payload) - 1] = '\0';
 
   if (isMacInKnownNodes(dest_mac)) {
-      esp_now_peer_info_t peerInfo;
-      memset(&peerInfo, 0, sizeof(peerInfo));
-      memcpy(peerInfo.peer_addr, dest_mac, 6);
-      uint8_t primary_channel;
-      wifi_second_chan_t second;
-      esp_wifi_get_channel(&primary_channel, &second);
-      peerInfo.channel = primary_channel;
-      peerInfo.encrypt = false;
+    // Envío directo (sin modificar path)
+    // peerInfo igual que antes
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, dest_mac, 6);
+    uint8_t primary_channel;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&primary_channel, &second);
+    peerInfo.channel = primary_channel;
+    peerInfo.encrypt = false;
 
-      // Verifica que el mensaje no sea demasiado largo
-      if (msg_payload.length() >= sizeof(s_msg.payload)) {
-        Serial.println("Mensaje demasiado largo. Reduce el texto.");
-        return;
-      }
-
-      // Elimina el peer si ya existe
-      if (esp_now_is_peer_exist(dest_mac)) {
-        esp_now_del_peer(dest_mac);
-      }
-      // Intenta agregar el peer
-      esp_err_t add_status = esp_now_add_peer(&peerInfo);
-      if (add_status != ESP_OK) {
-          Serial.print("Error al agregar peer para SEND: ");
-          Serial.println(esp_err_to_name(add_status));
-          printMacAddress(dest_mac);
-          return;
-      }
-
-      esp_err_t result = esp_now_send(dest_mac, (uint8_t *)&s_msg, sizeof(send_message_t));
-      if (result == ESP_OK) {
-        Serial.print("Mensaje SEND enviado directamente a ");
-        printMacAddress(dest_mac);
-      } else {
-        Serial.print("Error al enviar directamente SEND a ");
-        printMacAddress(dest_mac);
-        Serial.println(esp_err_to_name(result));
-      }
-  } else {
-      Serial.print("El nodo ");
+    if (esp_now_is_peer_exist(dest_mac)) {
+      esp_now_del_peer(dest_mac);
+    }
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.print("Error al agregar peer para envío directo: ");
       printMacAddress(dest_mac);
-      Serial.println(" no es un vecino conocido. Iniciando reenvío.");
-      for (const auto& node : known_nodes) {
-          esp_err_t result = esp_now_send(node.mac_addr, (uint8_t *)&s_msg, sizeof(send_message_t));
-          if (result != ESP_OK) {
-              Serial.print("Error al iniciar reenvío SEND a ");
-              printMacAddress(node.mac_addr);
-              Serial.println(esp_err_to_name(result));
-          }
-      }
-      Serial.println("Mensaje SEND reenviado a vecinos para alcanzar el destino.");
+      return;
+    }
+
+    esp_err_t result = esp_now_send(dest_mac, (uint8_t *)&s_msg, sizeof(s_msg));
+    if (result == ESP_OK) {
+      Serial.print("Mensaje SEND enviado directamente a ");
+      printMacAddress(dest_mac);
+    } else {
+      Serial.print("Error al enviar directamente a ");
+      printMacAddress(dest_mac);
+      Serial.println(esp_err_to_name(result));
+    }
+  } else {
+    Serial.print("El nodo ");
+    printMacAddress(dest_mac);
+    Serial.println(" no es un vecino conocido. Iniciando reenvío.");
+
+    for (const auto& node : known_nodes) {
+      esp_now_send(node.mac_addr, (uint8_t *)&s_msg, sizeof(s_msg));
+    }
   }
 }
+
 
 // Función para unirse a la red
 void join_network(const uint8_t *known_node_mac_addr) {
@@ -707,6 +712,5 @@ void setup() {
 
 void loop() {
   handle_serial_input();
-  // Aquí puedes agregar otras tareas no relacionadas con la comunicación, si las tienes.
   delay(10); // Pequeña espera para no saturar el CPU
 }
